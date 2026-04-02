@@ -392,7 +392,7 @@ components:
       type: object
       description: Проверка логина
       properties:
-        login:
+        check_unique:
           type: object
           required: [ scheme, secret ]
           properties:
