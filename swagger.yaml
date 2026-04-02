@@ -217,6 +217,35 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CtrlResponse'
+  /check_unique:
+    post:
+      tags: [ Auth ]
+      summary: Проверка зарегистрированного номера
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckLoginRequest'
+      responses:
+        '200':
+          description: Номер свободен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckLoginResponse'
+        '409':
+          description: Номер занят
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckLoginResponse'
+        'default':
+          description: Ошибка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CtrlResponse'
 components:
   schemas:
 
@@ -359,6 +388,23 @@ components:
           type: string
           description: Ответ на challenge
 
+    CheckLoginRequest:
+      type: object
+      description: Проверка логина
+      properties:
+        login:
+          type: object
+          required: [ scheme, secret ]
+          properties:
+            id:
+              type: string
+              example: "3"
+            scheme:
+              type: string
+              enum: [ wordcolor ]
+            secret:
+              type: string
+              description: base64("phone") для wordcolor
     # ====================== ОТВЕТЫ СЕРВЕРА ======================
 
     CtrlResponse:
@@ -457,6 +503,22 @@ components:
                   properties:
                     meth: { type: string, example: "captcha" }
                     payload: { type: string }
+
+    CheckLoginResponse:
+      type: object
+      properties:
+        check_unique:
+          type: object
+          properties:
+            id:
+              type: string
+              example: "3"
+            unique:
+              type: boolean
+              description: Если `true`, значит свободен
+            code:
+              type: integer
+              description: Статус ответа, 200 - свободен, 409 - занят
 
     ErrorResponse:
       type: object
