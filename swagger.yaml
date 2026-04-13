@@ -246,6 +246,42 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CtrlResponse'
+  /check_alias:
+    post:
+      tags: [ Auth ]
+      summary: Проверка уникальности alias пользователя
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckAliasRequest'
+            examples:
+              simple:
+                summary: Проверка alias
+                value:
+                  check_alias:
+                    id: "4"
+                    alias: "john"
+      responses:
+        '200':
+          description: Alias свободен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckAliasResponse'
+        '409':
+          description: Alias занят
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckAliasResponse'
+        'default':
+          description: Ошибка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CtrlResponse'
 components:
   schemas:
 
@@ -405,6 +441,22 @@ components:
             secret:
               type: string
               description: base64("phone") для wordcolor
+
+    CheckAliasRequest:
+      type: object
+      description: Проверка доступности alias пользователя через websocket
+      properties:
+        check_alias:
+          type: object
+          required: [ alias ]
+          properties:
+            id:
+              type: string
+              example: "4"
+            alias:
+              type: string
+              description: Alias без префикса или с префиксом `alias:`
+              example: "john"
     # ====================== ОТВЕТЫ СЕРВЕРА ======================
 
     CtrlResponse:
@@ -519,6 +571,29 @@ components:
             code:
               type: integer
               description: Статус ответа, 200 - свободен, 409 - занят
+
+    CheckAliasResponse:
+      type: object
+      properties:
+        check_alias:
+          type: object
+          properties:
+            id:
+              type: string
+              example: "4"
+            alias:
+              type: string
+              description: Нормализованный alias с namespace-префиксом
+              example: "alias:john"
+            available:
+              type: boolean
+              description: Если `true`, alias свободен
+            code:
+              type: integer
+              description: Статус ответа, 200 - свободен, 409 - занят
+            text:
+              type: string
+              example: "ok"
 
     ErrorResponse:
       type: object
