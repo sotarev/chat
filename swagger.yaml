@@ -1,4 +1,4 @@
-openapi: 3.0.4
+openapi: 3.1.0
 info:
   title: FinChat API
   description: |
@@ -282,6 +282,87 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CtrlResponse'
+  /file/u:
+    post:
+      tags: [ Files ]
+      summary: Получить presigned URL для direct upload
+      description: |
+        Возвращает одноразовую presigned-ссылку для загрузки файла напрямую в Object Storage.
+
+        Требования:
+        - media handler `s3_multibucket`
+        - в конфиге `direct_upload: true`
+
+        Инструкция по применению:
+        1. Выполните этот запрос с `direct=true` и передайте один из параметров: `ext` либо `mime`; получите `ctrl.params.upload_url`, `ctrl.params.upload_method`, `ctrl.params.url`, `ctrl.params.cache_control`, `ctrl.params.content_type`.
+        2. Загрузите файл по `upload_url` методом `upload_method` (`PUT`) как бинарный body:
+           - `Content-Type` должен быть равен `content_type` из ответа
+           - `Cache-Control` должен быть строго равен `cache_control` из ответа
+           - не добавляйте auth-заголовки FinChat при PUT в storage
+        3. Отправьте `{pub}` по WebSocket и укажите `ctrl.params.url` в контенте/вложении.
+        4. Обязательно продублируйте этот же URL в `extra.attachments`, иначе файл может быть удален сборщиком мусора как неиспользуемый.
+      parameters:
+        - in: query
+          name: direct
+          required: true
+          schema:
+            type: boolean
+            enum: [true]
+          description: Включить режим direct upload через presigned URL
+        - in: query
+          name: mime
+          required: false
+          schema:
+            type: string
+            example: image/jpeg
+          description: MIME-тип загружаемого файла. Используется, если не передан `extension`/`ext`.
+
+        - in: query
+          name: ext
+          required: false
+          schema:
+            type: string
+            example: jpg
+          description: Расширение файла с точкой или без (`jpg` или `.jpg`). Имеет приоритет над `mime` и используется как суффикс в `ctrl.params.url`.
+        - in: header
+          name: X-Finchat-APIKey
+          required: true
+          schema:
+            type: string
+        - in: header
+          name: X-Finchat-Auth
+          required: true
+          schema:
+            type: string
+          description: |
+            Авторизация пользователя, например `Token <token>`.
+      responses:
+        '200':
+          description: Presigned URL успешно выдан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PresignedUploadResponse'
+              examples:
+                success:
+                  summary: Ответ с данными для direct upload
+                  value:
+                    ctrl:
+                      code: 200
+                      text: "ok"
+                      params:
+                        url: "/v0/file/s/mfHLxDWFhfU.jpg"
+                        upload_url: "https://bucket.storage.yandexcloud.net/2ezj66bddxnam?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-SignedHeaders=cache-control%3Bcontent-type%3Bhost&X-Amz-Signature=..."
+                        upload_method: "PUT"
+                        content_type: "image/jpeg"
+                        cache_control: "max-age=86400"
+                      ts: "2026-05-26T17:07:19.000Z"
+        'default':
+          description: Ошибка выдачи presigned URL
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CtrlResponse'
 components:
   schemas:
 
@@ -506,6 +587,61 @@ components:
           enum: [auth, anon]
         challenge:
           type: object
+        url:
+          type: string
+          description: Относительный URL файла для последующей публикации и скачивания
+          example: "/v0/file/s/mfHLxDWFhfU.jpg"
+        upload_url:
+          type: string
+          description: Одноразовый presigned URL для загрузки файла напрямую в storage
+        upload_method:
+          type: string
+          description: HTTP-метод для загрузки по `upload_url`
+          example: "PUT"
+        content_type:
+          type: string
+          description: Значение заголовка `Content-Type`, которое нужно передать при PUT в `upload_url`
+          example: "image/jpeg"
+        cache_control:
+          type: string
+          description: Значение заголовка `Cache-Control`, которое нужно передать при PUT в `upload_url`
+          example: "no-cache, must-revalidate"
+
+    PresignedUploadResponse:
+      type: object
+      properties:
+        ctrl:
+          type: object
+          required: [code, text, params]
+          properties:
+            code:
+              type: integer
+              example: 200
+            text:
+              type: string
+              example: "ok"
+            params:
+              type: object
+              required: [url, upload_url, upload_method, content_type, cache_control]
+              properties:
+                url:
+                  type: string
+                  description: URL файла для использования в `{pub}` и `extra.attachments`
+                upload_url:
+                  type: string
+                  description: Presigned URL для прямой загрузки в storage
+                upload_method:
+                  type: string
+                  example: "PUT"
+                content_type:
+                  type: string
+                  description: Обязательное значение `Content-Type` для PUT
+                cache_control:
+                  type: string
+                  description: Обязательное значение `Cache-Control` для PUT
+            ts:
+              type: string
+              format: date-time
 
     HiSuccessResponse:
       type: object
@@ -648,3 +784,5 @@ tags:
     description: WebSocket соединение и формат сообщений
   - name: Auth
     description: Handshake, регистрация и авторизация пользователей
+  - name: Files
+    description: Загрузка и работа с файлами (direct upload через presigned URL)
