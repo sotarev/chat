@@ -9,8 +9,42 @@ info:
     
     После установления WebSocket-соединения клиент **обязан** отправить первое сообщение `{hi}`.
     
-    **В данной спецификации** каждое клиентское сообщение представлено как отдельный `POST`-запрос  
-    для удобства документирования и генерации клиентов в Swagger / OpenAPI tools.
+    **В данной спецификации** сообщения Finchat представлены как виртуальные `POST`-операции
+    исключительно для документирования. Это НЕ существующие HTTP-маршруты:
+    нельзя выполнять HTTP POST /calls/join или использовать сгенерированный REST-клиент для сигналинга.
+    Отправляйте JSON из requestBody по авторизованному WebSocket (либо JSON payload через gRPC).
+    Реальные HTTPS-маршруты звонков помечены тегом Calls HTTP и имеют отдельный HTTPS servers.
+
+    **Порядок интеграции звонков:** hi → login → подписка на me и нужный чат → start или ожидание invite →
+    ringing → join → подключение LiveKit SDK → leave/end. Для подписки отправьте
+    {"sub":{"id":"sub-1","topic":"usrPeer"}} (для me — topic="me") и дождитесь успеха.
+    После переподключения подпишитесь на чат и запросите status.
+    В hi.ctrl.params.calls сервер сообщает provider=livekit, commandsVersion=2,
+    notificationsVersion=2, group=true, maxParticipants, groupNotifications,
+    callWaiting=true и waitingAction=end-and-accept; callTimeout находится рядом в params.
+
+    **Ожидающий вызов:** входящий из другого чата не прерывает текущий разговор.
+    Мобильный клиент показывает его как ожидающий; при ответе сначала leave текущего звонка,
+    подтверждение/сверка status, отключение SDK, затем join ожидающего. Удержания,
+    атомарного переключения и глобальной блокировки нескольких звонков нет.
+    В группе приглашаются все подходящие по правам/уведомлениям участники, не выбранный список.
+    По умолчанию groupNotifications=notify (ring=false), режим ring включает массовый вызов.
+    Лимит по умолчанию 50 в группе, 2 в личном звонке; звонки в каналах не поддерживаются.
+
+    **Уведомления:** см. схемы CallNotificationInfo, CallRingingInfo, CallApnsVoip, CallFcmData.
+    Дедуплицируйте по callId и version, ставьте локальный таймер expiresAt;
+    запоздалый invite не должен заново открывать завершённый вызов.
+    История CallHistory не является источником входящих приглашений.
+    Быстрый ответ — две независимые команды: leave и обычный pub с текстом в том же чате;
+    отдельного rejected_with_message и атомарной операции нет.
+
+    **Не реализовано:** HTTPS выдача/обновление JWT, отдельный expiresAt JWT в ответе,
+    стабильная между сессиями полная identity, аватар в push, обмен ключами E2EE.
+    Не показывайте бейдж E2EE. Срок JWT (по умолчанию 60 секунд) не ограничивает длительность звонка.
+    Комнаты создаются заново на каждый звонок; при текущих defaults empty timeout=90 секунд,
+    departure timeout=60 секунд, backend reconnect timeout=60 секунд.
+    Настройки TURN и доставка реальных push должны быть проверены на стенде.
+    Подробности и конфигурация: docs/livekit-calls.md в репозитории.
   version: "0.22.x"
 
 servers:
@@ -20,6 +54,18 @@ servers:
       host:
         default: api.dev.finchat.club
         description: "Хост"
+
+x-call-server-messages:
+  notifications:
+    $ref: '#/components/schemas/CallNotificationInfo'
+  ringing:
+    $ref: '#/components/schemas/CallRingingInfo'
+  apnsVoip:
+    $ref: '#/components/schemas/CallApnsVoip'
+  fcm:
+    $ref: '#/components/schemas/CallFcmData'
+  history:
+    $ref: '#/components/schemas/CallHistory'
 
 paths:
   /:
@@ -363,8 +409,769 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CtrlResponse'
+  /calls/start:
+    post:
+      tags: [Calls (Finchat)]
+      operationId: callStart
+      summary: "[WS, не HTTP] Начать личный или групповой звонок"
+      x-websocket: true
+      x-transport: finchat
+      description: |
+        Виртуальная операция документации. HTTP-маршрута /calls/start НЕ существует.
+        Отправить pub через авторизованное соединение Finchat после подписки на чат. usr… — личный чат, grp… — группа. aonly=true ограничивает публикацию микрофоном; false разрешает видео. Сервер создаёт новую комнату на каждый звонок. Ответы приходят отдельно: ctrl.params.seq и приватный info с CallToken. Повторный активный звонок в том же чате: ctrl.code=486.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CallStartRequest'
+            example: {"pub":{"id":"start-1","topic":"usrPeer","head":{"webrtc":"started","aonly":true},"content":"Аудиозвонок"}}
+      responses:
+        '200':
+          $ref: '#/components/responses/CallFinchatResponse'
+  /calls/join:
+    post:
+      tags: [Calls (Finchat)]
+      operationId: callJoin
+      summary: "[WS, не HTTP] Принять вызов / получить или обновить JWT"
+      x-websocket: true
+      x-transport: finchat
+      description: |
+        Виртуальная операция документации. HTTP-маршрута /calls/join НЕ существует.
+        Ответ — приватный info с CallToken, без отдельного ctrl 200. Повтор в той же Finchat-сессии выдаёт токен той же identity и комнаты. Другая сессия получает 486. Просроченное непринятое приглашение: 410. В уже принятый групповой звонок можно войти после исходного expiresAt.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CallJoinRequest'
+            example: {"note":{"topic":"usrPeer","what":"call","event":"accept","seq":123,"payload":{"action":"join","requestId":"join-1"}}}
+      responses:
+        '200':
+          $ref: '#/components/responses/CallFinchatResponse'
+  /calls/resume:
+    post:
+      tags: [Calls (Finchat)]
+      operationId: callResume
+      summary: "[WS, не HTTP] Перенести участие в новую Finchat-сессию"
+      x-websocket: true
+      x-transport: finchat
+      description: |
+        Виртуальная операция документации. HTTP-маршрута /calls/resume НЕ существует.
+        Явно отключает предыдущего участника пользователя в LiveKit и выдаёт токен с новой identity. Это перенос, а не удержание. Обычное восстановление сети поручайте LiveKit SDK; не вызывайте resume при каждом сетевом сбое.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CallResumeRequest'
+            example: {"note":{"topic":"usrPeer","what":"call","event":"accept","seq":123,"payload":{"action":"resume","requestId":"resume-1"}}}
+      responses:
+        '200':
+          $ref: '#/components/responses/CallFinchatResponse'
+  /calls/status:
+    post:
+      tags: [Calls (Finchat)]
+      operationId: callStatus
+      summary: "[WS, не HTTP] Получить состояние звонка"
+      x-websocket: true
+      x-transport: finchat
+      description: |
+        Виртуальная операция документации. HTTP-маршрута /calls/status НЕ существует.
+        seq=0 позволяет узнать текущий звонок топика. После переподключения сначала подпишитесь на чат, особенно после рестарта backend. Ответ — приватный info с CallStatus, без JWT. active означает наличие записи звонка, не наличие медиасоединения.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CallStatusRequest'
+            example: {"note":{"topic":"usrPeer","what":"call","event":"accept","seq":0,"payload":{"action":"status","requestId":"status-1"}}}
+      responses:
+        '200':
+          $ref: '#/components/responses/CallFinchatResponse'
+  /calls/ringing:
+    post:
+      tags: [Calls (Finchat)]
+      operationId: callRinging
+      summary: "[WS, не HTTP] Подтвердить показ входящего вызова"
+      x-websocket: true
+      x-transport: finchat
+      description: |
+        Виртуальная операция документации. HTTP-маршрута /calls/ringing НЕ существует.
+        Передаёт инициатору info.event=ringing через me. Этот старый формат не содержит callId/version: сопоставляйте src+seq. Push ringing не отправляется. При requestId отправителю приходит ctrl с CallAck.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CallRingingRequest'
+            example: {"note":{"topic":"usrPeer","what":"call","event":"ringing","seq":123,"payload":{"requestId":"ringing-1"}}}
+      responses:
+        '200':
+          $ref: '#/components/responses/CallFinchatResponse'
+  /calls/leave:
+    post:
+      tags: [Calls (Finchat)]
+      operationId: callLeave
+      summary: "[WS, не HTTP] Отклонить, отменить или покинуть звонок"
+      x-websocket: true
+      x-transport: finchat
+      description: |
+        Виртуальная операция документации. HTTP-маршрута /calls/leave НЕ существует.
+        В личном чате завершает звонок: до принятия отказ получателя даёт declined, отмена инициатора — missed; после принятия — finished. В группе отключает только текущего участника; отказ не вошедшего пользователя закрывает приглашение только на его устройствах. Клиент также отключает LiveKit SDK. При requestId приходит CallAck.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CallLeaveRequest'
+            example: {"note":{"topic":"usrPeer","what":"call","event":"hang-up","seq":123,"payload":{"action":"leave","requestId":"leave-1"}}}
+      responses:
+        '200':
+          $ref: '#/components/responses/CallFinchatResponse'
+  /calls/end:
+    post:
+      tags: [Calls (Finchat)]
+      operationId: callEnd
+      summary: "[WS, не HTTP] Завершить звонок для всех"
+      x-websocket: true
+      x-transport: finchat
+      description: |
+        Виртуальная операция документации. HTTP-маршрута /calls/end НЕ существует.
+        Разрешено инициатору или администратору. Сначала сохраняется намерение завершить звонок и отправляются уведомления, затем удаляется комната. CallAck.state=ending означает, что очистка ещё продолжается. Клиент отключает LiveKit SDK.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CallEndRequest'
+            example: {"note":{"topic":"usrPeer","what":"call","event":"hang-up","seq":123,"payload":{"action":"end","requestId":"end-1"}}}
+      responses:
+        '200':
+          $ref: '#/components/responses/CallFinchatResponse'
+  /v0/calls/devices/voip:
+    servers:
+      - url: https://{host}
+        description: HTTPS backend Finchat (не LiveKit); при нестандартном api_path добавьте его к URL сервера.
+        variables:
+          host: {default: api.dev.finchat.club}
+    put:
+      tags: [Calls HTTP]
+      operationId: registerCallVoipDevice
+      summary: Зарегистрировать PushKit-токен iOS
+      description: |
+        Реальный HTTPS-метод. Доступен при включённом LiveKit.
+        Сначала зарегистрируйте обычный FCM-токен через hi.dev с платформой ios и выполните вход.
+        device должен принадлежать авторизованному пользователю. PushKit-токен хранится отдельно.
+        При ротации FCM-токена повторите регистрацию. Максимальный размер тела — 4096 байт.
+        Только заголовки авторизации: точный префикс "token " (нижний регистр).
+        Не используйте Bearer, cookie, sid, query-параметры или JWT LiveKit.
+      security:
+        - FinchatCallToken: []
+        - FinchatCallTokenAlternate: []
+      requestBody:
+        $ref: '#/components/requestBodies/CallVoipDevice'
+      responses:
+        '204': {description: Токен зарегистрирован; тело отсутствует}
+        '400': {$ref: '#/components/responses/CallHttpBadRequest'}
+        '401': {$ref: '#/components/responses/CallHttpUnauthorized'}
+        '403': {description: Устройство не принадлежит пользователю; ответ text/plain}
+        '405': {description: Метод не поддерживается; Allow содержит PUT и DELETE}
+        '503': {description: Временная ошибка хранилища; ответ text/plain}
+    delete:
+      tags: [Calls HTTP]
+      operationId: deleteCallVoipDevice
+      summary: Удалить PushKit-токен iOS
+      description: |
+        Реальный HTTPS-метод, JSON-тело обязательно, формат как при регистрации.
+        Вызывайте до выхода из аккаунта и удаления обычного FCM-токена.
+        Максимальный размер тела — 4096 байт.
+      security:
+        - FinchatCallToken: []
+        - FinchatCallTokenAlternate: []
+      requestBody:
+        $ref: '#/components/requestBodies/CallVoipDevice'
+      responses:
+        '204': {description: Удаление выполнено; тело отсутствует}
+        '400': {$ref: '#/components/responses/CallHttpBadRequest'}
+        '401': {$ref: '#/components/responses/CallHttpUnauthorized'}
+        '403': {description: Устройство не принадлежит пользователю; ответ text/plain}
+        '405': {description: Метод не поддерживается; Allow содержит PUT и DELETE}
+        '503': {description: Временная ошибка хранилища; ответ text/plain}
+  /v0/calls/livekit/webhook:
+    servers:
+      - url: https://{host}
+        description: HTTPS backend Finchat; при нестандартном api_path добавьте его к URL сервера.
+        variables:
+          host: {default: api.dev.finchat.club}
+    post:
+      tags: [Calls HTTP]
+      operationId: receiveLivekitWebhook
+      summary: Webhook от сервера LiveKit (не для мобильного клиента)
+      description: |
+        Настраивается на сервере LiveKit. Подпись JWT и SHA-256 исходного тела
+        проверяются библиотекой LiveKit с api_key/api_secret backend.
+        Не используйте токен Finchat. Прокси должен сохранять Authorization и исходное тело.
+        События запускают сверку через RoomService, а не напрямую изменяют участников.
+        Необрабатываемые события подтверждаются кодом 204.
+      security:
+        - LivekitWebhookSignature: []
+      requestBody:
+        required: true
+        content:
+          application/webhook+json:
+            schema:
+              $ref: '#/components/schemas/LivekitWebhookEvent'
+            example:
+              event: participant_joined
+              id: EV_example
+              createdAt: "1792152000"
+              room: {name: fc-example-room}
+              participant: {identity: "usrUser:sessionId"}
+      responses:
+        '204': {description: Принято или событие не требует обработки; тело отсутствует}
+        '401': {description: 'Невалидная подпись или тело, в том числе превышение лимита 1 МиБ; text/plain'}
+        '405': {description: Поддерживается только POST}
+        '503': {description: Временная ошибка; LiveKit должен повторить запрос; text/plain}
 components:
+  securitySchemes:
+    FinchatCallToken:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: 'Значение: token BASE64_FINCHAT_LOGIN_TOKEN. Не Bearer и не LiveKit JWT.'
+    FinchatCallTokenAlternate:
+      type: apiKey
+      in: header
+      name: X-Finchat-Auth
+      description: 'Альтернатива Authorization: token BASE64_FINCHAT_LOGIN_TOKEN. Передавайте только один из заголовков.'
+    LivekitWebhookSignature:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: Подписанный LiveKit JWT с контрольной суммой исходного тела; формируется сервером LiveKit.
+  requestBodies:
+    CallVoipDevice:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CallVoipDevice'
+          example: {device: FCM_TOKEN_FROM_HI_DEV, token: HEX_PUSHKIT_DEVICE_TOKEN}
+  responses:
+    CallHttpBadRequest:
+      description: Неверное тело или формат токена
+      content:
+        text/plain:
+          schema: {type: string}
+    CallHttpUnauthorized:
+      description: Отсутствует или невалиден токен входа Finchat
+      content:
+        text/plain:
+          schema: {type: string}
+    CallFinchatResponse:
+      description: |
+        НЕ HTTP-ответ: асинхронные сообщения существующего Finchat-соединения.
+        Указанный 200 — условность отображения Swagger. Реальные коды находятся в ctrl.code.
+        start получает ctrl с seq и отдельный info с JWT; join/resume — info с JWT;
+        status — info с состоянием; ringing/leave/end — ctrl с ack при наличии requestId.
+        Ошибки: 400 неверная команда, 401 авторизация, 403 права, 404 звонок не найден,
+        410 приглашение истекло, 486 звонок/сессия заняты или завершаются,
+        502 кластер недоступен, 503 временная ошибка.
+        ctrl.id равен requestId команды (для pub — pub.id).
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/CallPrivateInfo'
+              - $ref: '#/components/schemas/CallCtrlResponse'
   schemas:
+    CallStartRequest:
+      type: object
+      required: [pub]
+      properties:
+        pub:
+          type: object
+          required: [id, topic, head]
+          properties:
+            id: {type: string}
+            topic: {$ref: '#/components/schemas/CallTopic'}
+            head:
+              type: object
+              required: [webrtc]
+              properties:
+                webrtc: {type: string, const: started}
+                aonly: {type: boolean, default: false}
+            content:
+              description: Содержимое сообщения истории, например «Аудиозвонок».
+              type: string
+    CallJoinRequest:
+      type: object
+      required: [note]
+      properties:
+        note:
+          type: object
+          required: [topic, what, event, seq, payload]
+          properties:
+            topic: {$ref: '#/components/schemas/CallTopic'}
+            what: {type: string, const: call}
+            event: {type: string, const: accept}
+            seq: {type: integer, minimum: 1}
+            payload:
+              type: object
+              required: [action, requestId]
+              properties:
+                action: {type: string, const: join}
+                requestId: {$ref: '#/components/schemas/CallRequestId'}
+    CallResumeRequest:
+      type: object
+      required: [note]
+      properties:
+        note:
+          type: object
+          required: [topic, what, event, seq, payload]
+          properties:
+            topic: {$ref: '#/components/schemas/CallTopic'}
+            what: {type: string, const: call}
+            event: {type: string, const: accept}
+            seq: {type: integer, minimum: 1}
+            payload:
+              type: object
+              required: [action, requestId]
+              properties:
+                action: {type: string, const: resume}
+                requestId: {$ref: '#/components/schemas/CallRequestId'}
+    CallStatusRequest:
+      type: object
+      required: [note]
+      properties:
+        note:
+          type: object
+          required: [topic, what, event, seq, payload]
+          properties:
+            topic: {$ref: '#/components/schemas/CallTopic'}
+            what: {type: string, const: call}
+            event: {type: string, const: accept}
+            seq: {type: integer, minimum: 0, default: 0}
+            payload:
+              type: object
+              required: [action, requestId]
+              properties:
+                action: {type: string, const: status}
+                requestId: {$ref: '#/components/schemas/CallRequestId'}
+    CallRingingRequest:
+      type: object
+      required: [note]
+      properties:
+        note:
+          type: object
+          required: [topic, what, event, seq, payload]
+          properties:
+            topic: {$ref: '#/components/schemas/CallTopic'}
+            what: {type: string, const: call}
+            event: {type: string, const: ringing}
+            seq: {type: integer, minimum: 1}
+            payload:
+              type: object
+              required: [requestId]
+              properties:
+                requestId: {$ref: '#/components/schemas/CallRequestId'}
+    CallLeaveRequest:
+      type: object
+      required: [note]
+      properties:
+        note:
+          type: object
+          required: [topic, what, event, seq, payload]
+          properties:
+            topic: {$ref: '#/components/schemas/CallTopic'}
+            what: {type: string, const: call}
+            event: {type: string, const: hang-up}
+            seq: {type: integer, minimum: 1}
+            payload:
+              type: object
+              required: [action, requestId]
+              properties:
+                action: {type: string, const: leave}
+                requestId: {$ref: '#/components/schemas/CallRequestId'}
+    CallEndRequest:
+      type: object
+      required: [note]
+      properties:
+        note:
+          type: object
+          required: [topic, what, event, seq, payload]
+          properties:
+            topic: {$ref: '#/components/schemas/CallTopic'}
+            what: {type: string, const: call}
+            event: {type: string, const: hang-up}
+            seq: {type: integer, minimum: 1}
+            payload:
+              type: object
+              required: [action, requestId]
+              properties:
+                action: {type: string, const: end}
+                requestId: {$ref: '#/components/schemas/CallRequestId'}
+    CallTopic:
+      type: string
+      description: Внешнее имя чата для текущего пользователя (usr… или grp…). Каналы не поддерживаются.
+      example: usrPeer
+    CallRequestId:
+      type: string
+      maxLength: 128
+      description: |
+        Уникальная строка, максимум 128 байт UTF-8 (maxLength здесь ограничивает символы).
+        Схемы рекомендуют обязательное поле; backend допускает отсутствие для старых клиентов.
+        Корреляция, НЕ ключ идемпотентности. При потере ответа сверяйте status/callId/seq.
+    CallVoipDevice:
+      type: object
+      additionalProperties: false
+      required: [device, token]
+      properties:
+        device: {type: string, description: 'Обычный FCM-токен iOS, ранее зарегистрированный через hi.dev'}
+        token: {type: string, description: 'PushKit device token в hex, не JWT и не FCM-токен'}
+    CallToken:
+      type: object
+      required: [type, requestId, provider, url, token, room, identity, expiresIn, callId, version]
+      properties:
+        type: {type: string, const: token}
+        requestId: {type: string}
+        provider: {type: string, const: livekit}
+        url: {type: string, format: uri, example: 'wss://call.finchat.club'}
+        token: {type: string, description: Приватный JWT; не сохранять в журнал и не передавать другим участникам}
+        room: {type: string, example: fc-example-room}
+        identity: {type: string, example: 'usrUser:sessionId', description: 'Finchat user ID + ":" + Finchat session ID. Полная identity не стабильна между сессиями; профиль берётся по части до первого двоеточия.'}
+        expiresIn: {type: integer, minimum: 30, maximum: 300, example: 60, description: 'Срок первоначального входа в секундах. Отдельного JWT expiresAt нет; абсолютный срок находится в JWT exp.'}
+        callId: {type: string, format: uuid}
+        version: {type: integer, format: int64}
+    CallStatus:
+      type: object
+      required: [type, requestId, provider, active, state, participation, callWaiting, waitingAction]
+      description: |
+        При idle поля существующего звонка отсутствуют. active означает наличие записи, а не медиасоединение.
+        active-state означает, что первое медиасоединение было установлено; текущую сеть отслеживайте через SDK.
+        participants — допущенные пользователи, не обязательно подключённые.
+        accepted/connected могут быть нулевым временем 0001-01-01T00:00:00Z.
+      properties:
+        type: {type: string, const: status}
+        requestId: {type: string}
+        provider: {type: string, const: livekit}
+        active: {type: boolean}
+        state: {type: string, enum: [idle, ringing, expired, connecting, active, ending]}
+        participation: {type: string, enum: [none, not-joined, this-session, other-session]}
+        callWaiting: {type: boolean, const: true}
+        waitingAction: {type: string, const: end-and-accept}
+        callId: {type: string, format: uuid}
+        version: {type: integer, format: int64}
+        expiresAt: {type: string, format: date-time, description: 'Исходный срок приглашения, НЕ срок JWT или принятого звонка'}
+        room: {type: string}
+        originator: {type: string}
+        created: {type: string, format: date-time}
+        accepted: {type: string, format: date-time}
+        connected: {type: string, format: date-time}
+        ending: {type: string, description: Итоговый статус при завершении; иначе пустая строка}
+        audioOnly: {type: boolean}
+        group: {type: boolean}
+        canEnd: {type: boolean, description: Права на явную команду end}
+        participants:
+          type: array
+          items: {type: string}
+    CallPrivateInfo:
+      type: object
+      required: [info]
+      properties:
+        info:
+          type: object
+          required: [topic, what, event, seq, payload]
+          properties:
+            topic: {$ref: '#/components/schemas/CallTopic'}
+            what: {type: string, const: call}
+            event: {type: string, const: accept}
+            seq: {type: integer, minimum: 0, description: Исходный номер сообщения звонка; 0 при отсутствии звонка в status}
+            payload:
+              oneOf:
+                - $ref: '#/components/schemas/CallToken'
+                - $ref: '#/components/schemas/CallStatus'
+      example:
+        info:
+          topic: usrPeer
+          what: call
+          event: accept
+          seq: 123
+          payload:
+            type: token
+            requestId: join-1
+            provider: livekit
+            url: wss://call.finchat.club
+            token: JWT
+            room: fc-example-room
+            identity: usrUser:sessionId
+            expiresIn: 60
+            callId: 663e26ca-50cc-5965-8478-12ff882d1968
+            version: 4
+    CallAck:
+      type: object
+      required: [type, requestId, action, callId, seq, state]
+      properties:
+        type: {type: string, const: ack}
+        requestId: {type: string}
+        action: {type: string, enum: [ringing, leave, end]}
+        callId: {type: string, format: uuid}
+        seq: {type: integer}
+        state: {type: string, enum: [applied, ending, ended]}
+    CallCtrlResponse:
+      type: object
+      required: [ctrl]
+      properties:
+        ctrl:
+          type: object
+          required: [code, text, ts]
+          properties:
+            id: {type: string}
+            topic: {type: string}
+            code: {type: integer, description: 'Реальный код результата, не HTTP-код виртуальной операции'}
+            text: {type: string}
+            ts: {type: string, format: date-time}
+            params:
+              anyOf:
+                - $ref: '#/components/schemas/CallAck'
+                - type: object
+                  properties:
+                    seq: {type: integer}
+      example:
+        ctrl:
+          id: leave-1
+          topic: usrPeer
+          code: 200
+          text: ok
+          ts: '2026-10-16T12:00:00Z'
+          params:
+            type: ack
+            requestId: leave-1
+            action: leave
+            callId: 663e26ca-50cc-5965-8478-12ff882d1968
+            seq: 123
+            state: ended
+    CallNotification:
+      type: object
+      required: [callId, event, version, topic, seq, from, audioOnly, group, ring, createdAt, expiresAt]
+      description: |
+        События генерирует backend. Дедупликация по callId+version; пропуски версий допустимы.
+        accepted — первое принятие, инициатору; не подтверждение медиа.
+        answered_elsewhere — другим устройствам ответившего пользователя.
+        declined — отказавшемуся от группового приглашения пользователю, не инициатору.
+        left — вышедшему участнику группы.
+        cancelled/ended — ранее уведомлённым пользователям.
+        Отказ в личном звонке: cancelled + reason=declined.
+        Отмена инициатором и таймаут: одинаковые cancelled + reason=missed.
+        Завершение принятого звонка: ended + reason=finished/disconnected.
+        Отдельного события busy нет; занятость другой комнаты не блокирует приглашение.
+        У invite expiresAt — срок приглашения; у управляющих событий — срок доставки (10 минут).
+        Аватара и ключа E2EE нет; title может отсутствовать.
+      properties:
+        callId: {type: string, format: uuid}
+        event: {type: string, enum: [invite, accepted, answered_elsewhere, declined, left, cancelled, ended]}
+        version: {type: integer, format: int64}
+        topic: {$ref: '#/components/schemas/CallTopic'}
+        seq: {type: integer}
+        from: {type: string}
+        title: {type: string, description: Имя собеседника или название группы}
+        audioOnly: {type: boolean}
+        group: {type: boolean}
+        ring: {type: boolean, description: Показать входящий вызов; false — уведомление о звонке в группе}
+        createdAt: {type: string, format: date-time}
+        expiresAt: {type: string, format: date-time}
+        reason: {type: string}
+    CallNotificationInfo:
+      type: object
+      description: |
+        Сервер → клиент через Finchat me. invite → внешний invite;
+        accepted/answered_elsewhere → accept; остальные → hang-up.
+        Не открывайте входящий экран по сообщениям истории с head.livekit.
+      required: [info]
+      properties:
+        info:
+          type: object
+          required: [topic, src, what, event, seq, payload]
+          properties:
+            topic: {type: string, const: me}
+            src: {$ref: '#/components/schemas/CallTopic'}
+            from: {type: string}
+            what: {type: string, const: call}
+            event: {type: string, enum: [invite, accept, hang-up]}
+            seq: {type: integer}
+            payload: {$ref: '#/components/schemas/CallNotification'}
+      example:
+        info:
+          topic: me
+          src: usrCaller
+          from: usrCaller
+          what: call
+          event: invite
+          seq: 123
+          payload:
+            callId: 663e26ca-50cc-5965-8478-12ff882d1968
+            event: invite
+            version: 1
+            topic: usrCaller
+            seq: 123
+            from: usrCaller
+            title: Алексей
+            audioOnly: true
+            group: false
+            ring: true
+            createdAt: '2026-10-16T12:00:00Z'
+            expiresAt: '2026-10-16T12:00:30Z'
+    CallRingingInfo:
+      type: object
+      description: Только Finchat, без push и callId/version. Сопоставление src+seq.
+      properties:
+        info:
+          type: object
+          properties:
+            topic: {type: string, const: me}
+            src: {type: string}
+            from: {type: string}
+            what: {type: string, const: call}
+            event: {type: string, const: ringing}
+            seq: {type: integer}
+      example:
+        info: {topic: me, src: usrCallee, from: usrCallee, what: call, event: ringing, seq: 123}
+    CallApnsVoip:
+      allOf:
+        - $ref: '#/components/schemas/CallNotification'
+        - type: object
+          required: [aps, what]
+          properties:
+            what: {type: string, const: call}
+            aps:
+              type: object
+              required: [content-available]
+              properties:
+                content-available: {type: integer, const: 1}
+      description: |
+        Backend → Apple → PushKit. Только invite с ring=true.
+        Заголовки apns-topic=<bundle_id>.voip, apns-push-type=voip, apns-priority=10.
+        APNs должен быть включён и настроен; FCM не подменяет VoIP при отсутствии настройки.
+        Управляющие события iOS идут через Finchat и фоновый APNs через FCM.
+        Групповой invite с ring=false идёт обычным alert через FCM.
+      example:
+        aps: {content-available: 1}
+        what: call
+        callId: 663e26ca-50cc-5965-8478-12ff882d1968
+        event: invite
+        version: 1
+        topic: usrCaller
+        seq: 123
+        from: usrCaller
+        title: Алексей
+        audioOnly: true
+        group: false
+        ring: true
+        createdAt: '2026-10-16T12:00:00Z'
+        expiresAt: '2026-10-16T12:00:30Z'
+    CallFcmData:
+      type: object
+      required: [data]
+      description: |
+        Android получает high-priority data-only FCM, без notification-блока.
+        TTL — оставшийся срок expiresAt. Поля data строковые, from переименован в xfrom.
+        Аватара нет. После успешной передачи провайдеру нет периодического повторного вызова;
+        при временных ошибках есть ограниченные повторы до expiresAt.
+        Доставка не гарантирована; после рестарта backend возможна потеря транспортной очереди.
+      properties:
+        data:
+          type: object
+          required: [what, callId, event, version, topic, seq, xfrom, title, audioOnly, group, ring, createdAt, expiresAt, reason]
+          additionalProperties: {type: string}
+          properties:
+            what: {type: string, const: call}
+            callId: {type: string, format: uuid}
+            event: {type: string, enum: [invite, accepted, answered_elsewhere, declined, left, cancelled, ended]}
+            version: {type: string}
+            topic: {type: string}
+            seq: {type: string}
+            xfrom: {type: string}
+            title: {type: string}
+            audioOnly: {type: string, enum: ['true', 'false']}
+            group: {type: string, enum: ['true', 'false']}
+            ring: {type: string, enum: ['true', 'false']}
+            createdAt: {type: string, format: date-time}
+            expiresAt: {type: string, format: date-time}
+            reason: {type: string}
+      example:
+        data:
+          what: call
+          callId: 663e26ca-50cc-5965-8478-12ff882d1968
+          event: invite
+          version: "1"
+          topic: usrCaller
+          seq: "123"
+          xfrom: usrCaller
+          title: Алексей
+          audioOnly: "true"
+          group: "false"
+          ring: "true"
+          createdAt: '2026-10-16T12:00:00Z'
+          expiresAt: '2026-10-16T12:00:30Z'
+          reason: ""
+    CallHistory:
+      type: object
+      description: |
+        Начальное pub отправляет клиент; accepted и итог пишет backend.
+        accepted в истории появляется после двух активных участников LiveKit.
+        Длительность в миллисекундах от первого медиасоединения до записи итога,
+        включая возможные задержки сверки/очистки. busy не записывается.
+      properties:
+        data:
+          type: object
+          properties:
+            topic: {type: string}
+            from: {type: string}
+            seq: {type: integer}
+            content: {}
+            head:
+              type: object
+              properties:
+                webrtc: {type: string, enum: [started, accepted, finished, missed, declined, disconnected]}
+                aonly: {type: boolean}
+                call-notifications: {type: string, const: v2}
+                livekit:
+                  type: object
+                  properties:
+                    room: {type: string}
+                replace: {type: string, example: ':123'}
+                webrtc-duration: {type: integer, format: int64, example: 42000}
+      example:
+        data:
+          topic: usrPeer
+          from: usrCaller
+          seq: 125
+          head:
+            webrtc: finished
+            aonly: true
+            call-notifications: v2
+            livekit: {room: fc-example-room}
+            replace: ':123'
+            webrtc-duration: 42000
+          content: Аудиозвонок
+    LivekitWebhookEvent:
+      type: object
+      description: Подмножество protobuf JSON LiveKit WebhookEvent. Максимум 1 МиБ; дополнительные поля допускаются.
+      properties:
+        event:
+          type: string
+          examples: [room_started, room_finished, participant_joined, participant_left, participant_connection_aborted]
+        id: {type: string}
+        createdAt: {type: string, description: Protobuf int64 в JSON}
+        room:
+          type: object
+          properties:
+            name: {type: string}
+        participant:
+          type: object
+          properties:
+            identity: {type: string}
 
     # ====================== ЗАПРОСЫ get_words и get_colors ======================
 
@@ -780,6 +1587,10 @@ components:
           ts: "2026-03-27T10:00:00.000Z"
 
 tags:
+  - name: Calls (Finchat)
+    description: Виртуальные операции сигналинга по авторизованному Finchat WebSocket/gRPC. Не REST endpoints.
+  - name: Calls HTTP
+    description: Реальные HTTPS-методы регистрации PushKit и серверного webhook LiveKit.
   - name: WebSocket
     description: WebSocket соединение и формат сообщений
   - name: Auth
